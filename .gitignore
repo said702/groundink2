@@ -8,7 +8,7 @@
 # Ship only the model assets used by the app.
 /frontend/assets/models/*.onnx
 !/frontend/assets/models/word_detection_model.onnx
-!/frontend/assets/models/char_model_nano_704.onnx
+!/frontend/assets/models/char_model_nano_256.onnx
 /frontend/assets/demo_camera.png
 
 # Local data, experiments, screenshots, and generated artifacts.

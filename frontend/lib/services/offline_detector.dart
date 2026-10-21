@@ -73,7 +73,7 @@ class OfflineDetector {
     _wordModel ??= Uint8List.sublistView(
         await rootBundle.load('assets/models/word_detection_model.onnx'));
     _charModel ??= Uint8List.sublistView(
-        await rootBundle.load('assets/models/char_model_nano_704.onnx'));
+        await rootBundle.load('assets/models/char_model_nano_256.onnx'));
     _dictionary ??=
         await rootBundle.loadString('assets/models/english_words.json');
   }

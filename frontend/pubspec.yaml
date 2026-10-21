@@ -23,5 +23,5 @@ flutter:
   uses-material-design: true
   assets:
     - assets/models/word_detection_model.onnx
-    - assets/models/char_model_nano_704.onnx
+    - assets/models/char_model_nano_256.onnx
     - assets/models/english_words.json

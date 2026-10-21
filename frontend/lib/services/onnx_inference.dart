@@ -36,7 +36,7 @@ class OnnxInference {
     // Zeichen-Modell laden
     final charBytes = charModel ??
         Uint8List.sublistView(
-            await rootBundle.load('assets/models/char_model_nano_704.onnx'));
+        await rootBundle.load('assets/models/char_model_nano_256.onnx'));
     _charSession = OrtSession.fromBuffer(charBytes, sessionOptions);
 
     // Wörterbuch laden
@@ -200,8 +200,8 @@ class OnnxInference {
       throw Exception('ONNX not initialized. Call OnnxInference.init() first.');
     }
 
-    // Mobile export retains the trained weights and returns the top 100 detections.
-    const inputSize = 704;
+    // Match the static 256x256 ONNX export used by this variant.
+    const inputSize = 256;
     final (resized, scale, padX, padY) = _letterbox(wordCrop, inputSize);
 
     // Bild → NCHW Float-Tensor
@@ -290,7 +290,7 @@ class OnnxInference {
       'z'
     ];
 
-    // Output: [1, 98, 100] = xywh(4), class scores(62), mask coefficients(32).
+    // Output: [1, 98, 1344] = xywh(4), class scores(62), mask coefficients(32).
     const numClasses = 62;
 
     final results = <Map<String, dynamic>>[];
