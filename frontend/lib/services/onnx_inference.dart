@@ -63,7 +63,53 @@ class OnnxInference {
     OrtEnv.instance.release();
   }
 
-  static (img.Image, double, int, int) _letterbox(img.Image source, int size) {
+  /// Scales [source] into a [size]x[size] gray (114) canvas, keeping aspect.
+  ///
+  /// Copies the resized rows straight into the canvas bytes. Produces the
+  /// same pixels as [letterboxReference], whose per-pixel `compositeImage`
+  /// blend took most of the per-word preparation time.
+  static (img.Image, double, int, int) letterbox(img.Image source, int size) {
+    final scale = math.min(size / source.width, size / source.height);
+    final width = (source.width * scale).round().clamp(1, size);
+    final height = (source.height * scale).round().clamp(1, size);
+    final left = (size - width) ~/ 2;
+    final top = (size - height) ~/ 2;
+    final resized = img.copyResize(source,
+        width: width, height: height, interpolation: img.Interpolation.linear);
+    final channels = resized.numChannels;
+    if (resized.format != img.Format.uint8 ||
+        resized.hasPalette ||
+        (channels != 3 && channels != 4)) {
+      return letterboxReference(source, size);
+    }
+    final src = resized.getBytes(
+        order: channels == 4 ? img.ChannelOrder.rgba : img.ChannelOrder.rgb);
+    final out = Uint8List(size * size * 3)..fillRange(0, size * size * 3, 114);
+    for (var y = 0; y < height; y++) {
+      var o = ((top + y) * size + left) * 3;
+      var s = y * width * channels;
+      for (var x = 0; x < width; x++, s += channels) {
+        // Translucent pixels are blended by compositeImage; keep that exact.
+        if (channels == 4 && src[s + 3] != 255) {
+          return letterboxReference(source, size);
+        }
+        out[o++] = src[s];
+        out[o++] = src[s + 1];
+        out[o++] = src[s + 2];
+      }
+    }
+    return (
+      img.Image.fromBytes(
+          width: size, height: size, bytes: out.buffer, numChannels: 3),
+      scale,
+      left,
+      top
+    );
+  }
+
+  /// Original letterbox built on `img.fill` and `img.compositeImage`.
+  static (img.Image, double, int, int) letterboxReference(
+      img.Image source, int size) {
     final scale = math.min(size / source.width, size / source.height);
     final width = (source.width * scale).round().clamp(1, size);
     final height = (source.height * scale).round().clamp(1, size);
@@ -98,6 +144,53 @@ class OnnxInference {
     return input;
   }
 
+  /// Creates a float tensor that ONNX Runtime reads straight from [data].
+  ///
+  /// `OrtValueTensor.createTensorWithDataList` flattens its input into a
+  /// growable `List<double>` first, boxing every value (~200k per word for
+  /// the character model, ~1.2M for the word model). This copies the typed
+  /// list into native memory in one go and builds the same tensor.
+  static OrtValueTensor createFloatTensor(Float32List data, List<int> shape) {
+    final api = OrtEnv.instance.ortApiPtr.ref;
+    final dataPtr = calloc<ffi.Float>(data.length);
+    dataPtr.asTypedList(data.length).setAll(0, data);
+    final shapePtr = calloc<ffi.Int64>(shape.length);
+    shapePtr.asTypedList(shape.length).setAll(0, shape);
+    final memInfoPtrPtr = calloc<ffi.Pointer<bg.OrtMemoryInfo>>();
+    final valuePtrPtr = calloc<ffi.Pointer<bg.OrtValue>>();
+    try {
+      OrtStatus.checkOrtStatus(api.AllocatorGetInfo.asFunction<
+              bg.OrtStatusPtr Function(ffi.Pointer<bg.OrtAllocator>,
+                  ffi.Pointer<ffi.Pointer<bg.OrtMemoryInfo>>)>()(
+          OrtAllocator.instance.ptr, memInfoPtrPtr));
+      OrtStatus.checkOrtStatus(api.CreateTensorWithDataAsOrtValue.asFunction<
+              bg.OrtStatusPtr Function(
+                  ffi.Pointer<bg.OrtMemoryInfo>,
+                  ffi.Pointer<ffi.Void>,
+                  int,
+                  ffi.Pointer<ffi.Int64>,
+                  int,
+                  int,
+                  ffi.Pointer<ffi.Pointer<bg.OrtValue>>)>()(
+          memInfoPtrPtr.value,
+          dataPtr.cast(),
+          data.length * 4,
+          shapePtr,
+          shape.length,
+          ONNXTensorElementDataType.float.value,
+          valuePtrPtr));
+      // The tensor owns dataPtr and frees it in release().
+      return OrtValueTensor(valuePtrPtr.value, dataPtr.cast());
+    } catch (_) {
+      calloc.free(dataPtr);
+      rethrow;
+    } finally {
+      calloc.free(shapePtr);
+      calloc.free(memInfoPtrPtr);
+      calloc.free(valuePtrPtr);
+    }
+  }
+
   /// YOLO26n Wort-Detection: Bild → Bounding-Boxes von Wörtern.
   /// Gibt Liste von (bbox [x1,y1,x2,y2], confidence) zurück.
   static List<Map<String, dynamic>> detectWords(img.Image image,
@@ -108,14 +201,14 @@ class OnnxInference {
 
     // YOLO26n word detector expects a 640x640 RGB input.
     const inputSize = 640;
-    final (resized, scale, padX, padY) = _letterbox(image, inputSize);
+    final (resized, scale, padX, padY) = letterbox(image, inputSize);
 
     // Bild → NCHW Float-Tensor (1,3,640,640), normalisiert auf 0-1
     final input = toNchwFloat(resized, inputSize);
 
     // Input-Shape
     final shape = [1, 3, inputSize, inputSize];
-    final inputOrt = OrtValueTensor.createTensorWithDataList(input, shape);
+    final inputOrt = createFloatTensor(input, shape);
 
     // Input-Name aus dem Modell holen (meistens "images" bei YOLO)
     final runOptions = OrtRunOptions();
@@ -214,13 +307,13 @@ class OnnxInference {
 
     // Match the static 256x256 ONNX export used by this variant.
     const inputSize = 256;
-    final (resized, scale, padX, padY) = _letterbox(wordCrop, inputSize);
+    final (resized, scale, padX, padY) = letterbox(wordCrop, inputSize);
 
     // Bild → NCHW Float-Tensor
     final input = toNchwFloat(resized, inputSize);
 
     final shape = [1, 3, inputSize, inputSize];
-    final inputOrt = OrtValueTensor.createTensorWithDataList(input, shape);
+    final inputOrt = createFloatTensor(input, shape);
     final runOptions = OrtRunOptions();
     final inputs = {_charSession!.inputNames.first: inputOrt};
 
@@ -502,6 +595,11 @@ class OnnxInference {
     if (!identical(words, _cachedSetSource)) {
       _cachedSetSource = words;
       _cachedWordSet = words.toSet();
+      // Same order as iterating the set, so suggestions keep their order.
+      _cachedWordList = _cachedWordSet!.toList(growable: false);
+      _cachedMasks = Int32List.fromList(
+          [for (final w in _cachedWordList!) _letterMask(w)]);
+      _checkCache.clear();
     }
     final wordSet = _cachedWordSet!;
 
@@ -509,11 +607,23 @@ class OnnxInference {
       return (true, []);
     }
 
+    // Texts repeat words; the suggestion search is the expensive part.
+    final cached = _checkCache[lower];
+    if (cached != null) return (false, List.of(cached));
+
     // Einfache Edit-Distance-basierte Vorschläge (Levenshtein)
     final suggestions = <MapEntry<String, int>>[];
-    for (final dictWord in wordSet) {
-      if ((dictWord.length - lower.length).abs() > 2) continue;
-      final dist = _levenshtein(lower, dictWord, maxDistance: 2);
+    final length = lower.length;
+    final list = _cachedWordList!;
+    final masks = _cachedMasks!;
+    final mask = _letterMask(lower);
+    for (var i = 0; i < list.length; i++) {
+      final dictWord = list[i];
+      if ((dictWord.length - length).abs() > 2) continue;
+      // One edit changes at most two bits of the letter-presence mask, so
+      // more than four differing bits means a distance above 2.
+      if (_bitCount(masks[i] ^ mask) > 4) continue;
+      final dist = _levenshteinWithin2(lower, dictWord);
       if (dist <= 2) {
         suggestions.add(MapEntry(dictWord, dist));
       }
@@ -521,48 +631,81 @@ class OnnxInference {
 
     suggestions.sort((a, b) => a.value.compareTo(b.value));
     final top = suggestions.take(5).map((e) => e.key).toList();
-    return (false, top);
+    _checkCache[lower] = top;
+    return (false, List.of(top));
   }
 
   static List<String>? _cachedSetSource;
   static Set<String>? _cachedWordSet;
+  static List<String>? _cachedWordList;
+  static Int32List? _cachedMasks;
 
-  /// Levenshtein-Distanz zwischen zwei Strings.
-  ///
-  /// With [maxDistance], returns `maxDistance + 1` as soon as the distance is
-  /// known to exceed it; distances up to [maxDistance] are exact.
-  static int _levenshtein(String s1, String s2, {int? maxDistance}) {
-    if (s1 == s2) return 0;
-    if (s1.isEmpty) return s2.length;
-    if (s2.isEmpty) return s1.length;
-
-    final m = s2.length;
-    var previous = Int32List(m + 1);
-    var current = Int32List(m + 1);
-    for (int j = 0; j <= m; j++) {
-      previous[j] = j;
+  /// Bit set of the characters in [s] (any char→bit mapping keeps the
+  /// filter in [checkWord] exact; a-z get distinct bits). Bits 0-29 only,
+  /// so values stay positive in an Int32List.
+  static int _letterMask(String s) {
+    var mask = 0;
+    for (var i = 0; i < s.length; i++) {
+      mask |= 1 << (s.codeUnitAt(i) % 30);
     }
+    return mask;
+  }
 
-    for (int i = 1; i <= s1.length; i++) {
-      current[0] = i;
-      var rowMin = i;
+  static int _bitCount(int v) {
+    v = v - ((v >> 1) & 0x55555555);
+    v = (v & 0x33333333) + ((v >> 2) & 0x33333333);
+    return (((v + (v >> 4)) & 0x0F0F0F0F) * 0x01010101 >> 24) & 0xFF;
+  }
+
+  static final Map<String, List<String>> _checkCache = {};
+
+  static Int32List _bandPrev = Int32List(0), _bandCur = Int32List(0);
+
+  /// Levenshtein distance restricted to the diagonal band |i - j| <= 2.
+  ///
+  /// Exact for distances up to 2 (any such alignment stays in the band);
+  /// returns a value > 2 otherwise. Computes 5 cells per row instead of the
+  /// whole row and reuses its buffers.
+  static int _levenshteinWithin2(String s1, String s2) {
+    const k = 2;
+    const inf = 1 << 20;
+    final n = s1.length, m = s2.length;
+    if ((n - m).abs() > k) return k + 1;
+    if (s1 == s2) return 0;
+    if (n == 0) return m;
+    if (m == 0) return n;
+    if (_bandPrev.length < m + 2) {
+      _bandPrev = Int32List(m + 2);
+      _bandCur = Int32List(m + 2);
+    }
+    var prev = _bandPrev, cur = _bandCur;
+    for (var j = 0; j <= m + 1; j++) {
+      prev[j] = j <= k ? j : inf;
+    }
+    for (var i = 1; i <= n; i++) {
+      final lo = i - k > 1 ? i - k : 1;
+      final hi = i + k < m ? i + k : m;
+      cur[lo - 1] = lo == 1 ? (i <= k ? i : inf) : inf;
+      var rowMin = cur[lo - 1];
       final c1 = s1.codeUnitAt(i - 1);
-      for (int j = 1; j <= m; j++) {
+      for (var j = lo; j <= hi; j++) {
         final cost = c1 == s2.codeUnitAt(j - 1) ? 0 : 1;
-        var best = previous[j] + 1;
-        final insert = current[j - 1] + 1;
+        var best = prev[j] + 1;
+        final insert = cur[j - 1] + 1;
         if (insert < best) best = insert;
-        final substitute = previous[j - 1] + cost;
+        final substitute = prev[j - 1] + cost;
         if (substitute < best) best = substitute;
-        current[j] = best;
+        cur[j] = best;
         if (best < rowMin) rowMin = best;
       }
-      if (maxDistance != null && rowMin > maxDistance) return maxDistance + 1;
-      final swap = previous;
-      previous = current;
-      current = swap;
+      // Cell just right of the band must read as unreachable next row.
+      if (hi + 1 <= m) cur[hi + 1] = inf;
+      if (rowMin > k) return k + 1;
+      final swap = prev;
+      prev = cur;
+      cur = swap;
     }
-    return previous[m];
+    return prev[m];
   }
 
   /// Non-Maximum Suppression: entfernt überlappende Detections (IoU > threshold),

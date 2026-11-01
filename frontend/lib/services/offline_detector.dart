@@ -39,10 +39,10 @@ List<WordBox> sortWordsInReadingOrder(List<WordBox> words) {
       rowHeights.add(height);
     } else {
       rows[row].add(word);
-      rowCenters[row] =
-          (rowCenters[row] * (rows[row].length - 1) + center) / rows[row].length;
-      rowHeights[row] =
-          (rowHeights[row] * (rows[row].length - 1) + height) / rows[row].length;
+      rowCenters[row] = (rowCenters[row] * (rows[row].length - 1) + center) /
+          rows[row].length;
+      rowHeights[row] = (rowHeights[row] * (rows[row].length - 1) + height) /
+          rows[row].length;
     }
   }
 
@@ -68,7 +68,12 @@ class OfflineDetector {
   static Uint8List? _charModel;
   static String? _dictionary;
 
-  /// Loads asset data once; native sessions belong to the worker isolate.
+  /// Long-lived worker isolate holding the ONNX sessions and dictionary.
+  static Future<(Isolate, SendPort)>? _worker;
+  static const _workerExited = 'worker-exited';
+
+  /// Loads asset data once and starts the worker isolate in the background,
+  /// so the first photo does not pay for creating the sessions.
   static Future<void> initOnnx() async {
     _wordModel ??= Uint8List.sublistView(
         await rootBundle.load('assets/models/word_detection_model.onnx'));
@@ -76,12 +81,79 @@ class OfflineDetector {
         await rootBundle.load('assets/models/char_model_nano_256.onnx'));
     _dictionary ??=
         await rootBundle.loadString('assets/models/english_words.json');
+    _ensureWorker().ignore();
+  }
+
+  static Future<(Isolate, SendPort)> _ensureWorker() {
+    final existing = _worker;
+    if (existing != null) return existing;
+    final spawning = _spawnWorker();
+    _worker = spawning;
+    // A failed start must not be cached; the next photo retries.
+    spawning.then((_) {}, onError: (Object _) {
+      if (identical(_worker, spawning)) _worker = null;
+    });
+    return spawning;
+  }
+
+  static Future<(Isolate, SendPort)> _spawnWorker() async {
+    final ready = ReceivePort();
+    final exit = ReceivePort();
+    final isolate = await Isolate.spawn(
+      _workerMain,
+      (ready.sendPort, _wordModel!, _charModel!, _dictionary!),
+      onExit: exit.sendPort,
+      debugName: 'OfflineDetector',
+    );
+    final current = _worker;
+    exit.first.then((_) {
+      exit.close();
+      if (identical(_worker, current)) _worker = null;
+    });
+    final first = await ready.first;
+    ready.close();
+    if (first is _WorkerFailure) first.rethrowIt();
+    return (isolate, first as SendPort);
+  }
+
+  /// Entry point of the worker isolate: creates the sessions once, then
+  /// processes one photo per request, in order.
+  static Future<void> _workerMain(
+      (SendPort, Uint8List, Uint8List, String) args) async {
+    final (ready, wordModel, charModel, dictionary) = args;
+    final requests = ReceivePort();
+    try {
+      await OnnxInference.init(
+          wordModel: wordModel, charModel: charModel, dictionary: dictionary);
+      // Builds the dictionary set and index now instead of on the first word.
+      OnnxInference.checkWord('a');
+    } catch (e, st) {
+      requests.close();
+      OnnxInference.dispose();
+      ready.send(_WorkerFailure(e, st.toString()));
+      return;
+    }
+    ready.send(requests.sendPort);
+    await for (final message in requests) {
+      final (bytes, reply, progress) =
+          message as (Uint8List, SendPort, SendPort);
+      try {
+        reply.send(await _detectInIsolate(bytes, progress));
+      } catch (e, st) {
+        try {
+          reply.send(_WorkerFailure(e, st.toString()));
+        } catch (_) {
+          // The error object itself cannot cross isolates; keep its text.
+          reply.send(_WorkerFailure(Exception(e.toString()), st.toString()));
+        }
+      }
+    }
   }
 
   /// Haupt-Pipeline: Foto → erkannte Wörter mit Spellcheck.
   /// Mit optionalem Progress-Callback für interaktive UI.
   ///
-  /// Die komplette schwere Berechnung läuft in einem Isolate.
+  /// Die komplette schwere Berechnung läuft im Worker-Isolate.
   static Future<List<WordBox>> detect(File imageFile) async {
     final progressPort = ReceivePort();
     final subscription = progressPort.listen((message) {
@@ -95,25 +167,19 @@ class OfflineDetector {
       _updateProgress(DetectionProgress.loadingImage);
       final bytes = await imageFile.readAsBytes();
 
-      // 3. Komplette Pipeline im Isolate ausführen
-      // ONNX-Sessions sind im Isolate nicht verfügbar (statisch),
-      // daher laden wir die Modelle im Isolate neu.
-      // Load Flutter assets on the UI isolate; pass only data to the worker.
-      final wordModel = _wordModel!;
-      final charModel = _charModel!;
-      final dictionary = _dictionary!;
-      final sendProgress = progressPort.sendPort;
-      final results = await Isolate.run(() async {
-        try {
-          await OnnxInference.init(
-              wordModel: wordModel,
-              charModel: charModel,
-              dictionary: dictionary);
-          return await _detectInIsolate(bytes, sendProgress);
-        } finally {
-          OnnxInference.dispose();
-        }
-      });
+      // 3. Komplette Pipeline im Worker-Isolate ausführen
+      final (isolate, port) = await _ensureWorker();
+      final reply = ReceivePort();
+      isolate.addOnExitListener(reply.sendPort, response: _workerExited);
+      port.send((bytes, reply.sendPort, progressPort.sendPort));
+      final response = await reply.first;
+      isolate.removeOnExitListener(reply.sendPort);
+      reply.close();
+      if (response == _workerExited) {
+        throw Exception('The recognition worker stopped unexpectedly.');
+      }
+      if (response is _WorkerFailure) response.rethrowIt();
+      final results = response as List<WordBox>;
 
       _updateProgress(DetectionProgress.done);
       return results;
@@ -227,4 +293,15 @@ class OfflineDetector {
   static void _updateProgress(DetectionProgress progress) {
     progressNotifier?.update(progress);
   }
+}
+
+/// An error raised in the worker isolate, rethrown on the caller's side.
+class _WorkerFailure {
+  final Object error;
+  final String stackTrace;
+
+  const _WorkerFailure(this.error, this.stackTrace);
+
+  Never rethrowIt() =>
+      Error.throwWithStackTrace(error, StackTrace.fromString(stackTrace));
 }

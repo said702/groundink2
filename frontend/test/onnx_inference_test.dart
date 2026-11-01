@@ -78,8 +78,13 @@ void main() {
       'handwritting',
       'definately',
       'cat',
+      // Words recognized on the emulator benchmark images.
+      'ittle', 'broter', 'scol', 'writs', 'Schoals', 'compivter',
+      'correctet', 'spellink', 'sbrith', 'braucht', 'folgende', 'Dnge',
+      'asser', 'ibe', 'Far', 'ab', 'xq', 'zzzzzzzzzzzzzzzzzz',
     ];
-    for (final word in samples) {
+    // Second pass hits the per-word suggestion cache.
+    for (final word in [...samples, ...samples]) {
       final (ok, suggestions) =
           OnnxInference.checkWord(word, dictionary: dictionary);
       final (expectedOk, expectedSuggestions) =
