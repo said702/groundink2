@@ -73,7 +73,16 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _pickImage(ImageSource source) async {
     final picker = ImagePicker();
-    final picked = await picker.pickImage(source: source, imageQuality: 85);
+    // Real device cameras (e.g. iPad: 12 MP) deliver far more pixels than the
+    // models need (640 px word detector, 256 px character model). Decoding and
+    // preprocessing full-resolution photos in Dart is what made analysis slow
+    // on hardware while the emulator's small camera frames stayed fast.
+    final picked = await picker.pickImage(
+      source: source,
+      maxWidth: 2048,
+      maxHeight: 2048,
+      imageQuality: 85,
+    );
     if (picked == null) return;
     final file = File(picked.path);
 

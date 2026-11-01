@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io' show Platform;
 import 'dart:typed_data';
 import 'dart:math' as math;
 import 'package:flutter/services.dart' show rootBundle;
@@ -24,7 +25,8 @@ class OnnxInference {
 
     // Session-Optionen
     final sessionOptions = OrtSessionOptions();
-    sessionOptions.setIntraOpNumThreads(2);
+    sessionOptions.setIntraOpNumThreads(
+        math.max(1, math.min(4, Platform.numberOfProcessors)));
     sessionOptions.setInterOpNumThreads(1);
 
     // Wort-Modell laden
@@ -36,7 +38,7 @@ class OnnxInference {
     // Zeichen-Modell laden
     final charBytes = charModel ??
         Uint8List.sublistView(
-        await rootBundle.load('assets/models/char_model_nano_256.onnx'));
+            await rootBundle.load('assets/models/char_model_nano_256.onnx'));
     _charSession = OrtSession.fromBuffer(charBytes, sessionOptions);
 
     // Wörterbuch laden
@@ -74,6 +76,22 @@ class OnnxInference {
     return (canvas, scale, left, top);
   }
 
+  /// Converts a square RGB image into a normalized NCHW float tensor.
+  ///
+  /// Reads the raw RGB bytes once instead of calling `getPixel` per channel
+  /// and pixel, which allocated a pixel object for every access.
+  static Float32List toNchwFloat(img.Image image, int size) {
+    final rgb = image.getBytes(order: img.ChannelOrder.rgb);
+    final plane = size * size;
+    final input = Float32List(3 * plane);
+    for (int i = 0, src = 0; i < plane; i++, src += 3) {
+      input[i] = rgb[src] / 255.0;
+      input[plane + i] = rgb[src + 1] / 255.0;
+      input[2 * plane + i] = rgb[src + 2] / 255.0;
+    }
+    return input;
+  }
+
   /// YOLO26n Wort-Detection: Bild → Bounding-Boxes von Wörtern.
   /// Gibt Liste von (bbox [x1,y1,x2,y2], confidence) zurück.
   static List<Map<String, dynamic>> detectWords(img.Image image,
@@ -87,18 +105,7 @@ class OnnxInference {
     final (resized, scale, padX, padY) = _letterbox(image, inputSize);
 
     // Bild → NCHW Float-Tensor (1,3,640,640), normalisiert auf 0-1
-    final input = Float32List(1 * 3 * inputSize * inputSize);
-    int idx = 0;
-    for (int c = 0; c < 3; c++) {
-      for (int y = 0; y < inputSize; y++) {
-        for (int x = 0; x < inputSize; x++) {
-          final pixel = resized.getPixel(x, y);
-          // RGB-Kanal-Reihenfolge: R=0, G=1, B=2
-          final value = c == 0 ? pixel.r : (c == 1 ? pixel.g : pixel.b);
-          input[idx++] = value / 255.0;
-        }
-      }
-    }
+    final input = toNchwFloat(resized, inputSize);
 
     // Input-Shape
     final shape = [1, 3, inputSize, inputSize];
@@ -125,9 +132,8 @@ class OnnxInference {
     final inner = outputData[0] as List<dynamic>;
     final first = inner.first as List<dynamic>;
     final isEndToEnd = first.length == 6;
-    final numDetections = isEndToEnd
-        ? inner.length
-        : (inner[0] as List<dynamic>).length;
+    final numDetections =
+        isEndToEnd ? inner.length : (inner[0] as List<dynamic>).length;
 
     for (int d = 0; d < numDetections; d++) {
       late final double x1, y1, x2, y2, conf;
@@ -205,17 +211,7 @@ class OnnxInference {
     final (resized, scale, padX, padY) = _letterbox(wordCrop, inputSize);
 
     // Bild → NCHW Float-Tensor
-    final input = Float32List(1 * 3 * inputSize * inputSize);
-    int idx = 0;
-    for (int c = 0; c < 3; c++) {
-      for (int y = 0; y < inputSize; y++) {
-        for (int x = 0; x < inputSize; x++) {
-          final pixel = resized.getPixel(x, y);
-          final value = c == 0 ? pixel.r : (c == 1 ? pixel.g : pixel.b);
-          input[idx++] = value / 255.0;
-        }
-      }
-    }
+    final input = toNchwFloat(resized, inputSize);
 
     final shape = [1, 3, inputSize, inputSize];
     final inputOrt = OrtValueTensor.createTensorWithDataList(input, shape);
@@ -427,7 +423,12 @@ class OnnxInference {
     if (word.isEmpty) return (true, []);
 
     final lower = word.toLowerCase();
-    final wordSet = words.toSet();
+    // Building a set from the ~200k-word list used to happen for every word.
+    if (!identical(words, _cachedSetSource)) {
+      _cachedSetSource = words;
+      _cachedWordSet = words.toSet();
+    }
+    final wordSet = _cachedWordSet!;
 
     if (wordSet.contains(lower)) {
       return (true, []);
@@ -437,7 +438,7 @@ class OnnxInference {
     final suggestions = <MapEntry<String, int>>[];
     for (final dictWord in wordSet) {
       if ((dictWord.length - lower.length).abs() > 2) continue;
-      final dist = _levenshtein(lower, dictWord);
+      final dist = _levenshtein(lower, dictWord, maxDistance: 2);
       if (dist <= 2) {
         suggestions.add(MapEntry(dictWord, dist));
       }
@@ -448,32 +449,45 @@ class OnnxInference {
     return (false, top);
   }
 
+  static List<String>? _cachedSetSource;
+  static Set<String>? _cachedWordSet;
+
   /// Levenshtein-Distanz zwischen zwei Strings.
-  static int _levenshtein(String s1, String s2) {
+  ///
+  /// With [maxDistance], returns `maxDistance + 1` as soon as the distance is
+  /// known to exceed it; distances up to [maxDistance] are exact.
+  static int _levenshtein(String s1, String s2, {int? maxDistance}) {
     if (s1 == s2) return 0;
     if (s1.isEmpty) return s2.length;
     if (s2.isEmpty) return s1.length;
 
-    final matrix =
-        List.generate(s1.length + 1, (i) => List.filled(s2.length + 1, 0));
-    for (int i = 0; i <= s1.length; i++) {
-      matrix[i][0] = i;
-    }
-    for (int j = 0; j <= s2.length; j++) {
-      matrix[0][j] = j;
+    final m = s2.length;
+    var previous = Int32List(m + 1);
+    var current = Int32List(m + 1);
+    for (int j = 0; j <= m; j++) {
+      previous[j] = j;
     }
 
     for (int i = 1; i <= s1.length; i++) {
-      for (int j = 1; j <= s2.length; j++) {
-        final cost = s1[i - 1] == s2[j - 1] ? 0 : 1;
-        matrix[i][j] = [
-          matrix[i - 1][j] + 1,
-          matrix[i][j - 1] + 1,
-          matrix[i - 1][j - 1] + cost,
-        ].reduce((a, b) => a < b ? a : b);
+      current[0] = i;
+      var rowMin = i;
+      final c1 = s1.codeUnitAt(i - 1);
+      for (int j = 1; j <= m; j++) {
+        final cost = c1 == s2.codeUnitAt(j - 1) ? 0 : 1;
+        var best = previous[j] + 1;
+        final insert = current[j - 1] + 1;
+        if (insert < best) best = insert;
+        final substitute = previous[j - 1] + cost;
+        if (substitute < best) best = substitute;
+        current[j] = best;
+        if (best < rowMin) rowMin = best;
       }
+      if (maxDistance != null && rowMin > maxDistance) return maxDistance + 1;
+      final swap = previous;
+      previous = current;
+      current = swap;
     }
-    return matrix[s1.length][s2.length];
+    return previous[m];
   }
 
   /// Non-Maximum Suppression: entfernt überlappende Detections (IoU > threshold),
@@ -527,5 +541,4 @@ class OnnxInference {
 
     return keep;
   }
-
 }

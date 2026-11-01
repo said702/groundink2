@@ -42,6 +42,27 @@ flutter run -d <device-id>
 For Android, Android Studio and an Android SDK are required. For iOS, use a Mac
 with Xcode installed and an iPad or iPhone configured for development.
 
+### Performance on a physical iPad / iPhone
+
+Flutter **Debug** builds are very slow on real iOS devices because Dart code is
+not compiled ahead of time. The image processing in this app is pure Dart, so a
+Debug build can take minutes for a single photo. Always run a Release (or
+Profile) build on hardware:
+
+```sh
+cd frontend
+flutter run --release -d <ipad-id>
+```
+
+When starting from Xcode (`frontend/ios/Runner.xcworkspace`), the shared
+`Runner` scheme now runs the **Release** configuration. If it was changed
+locally, select *Product > Scheme > Edit Scheme > Run > Build Configuration >
+Release*. Run `flutter build ios --release` (or `flutter pub get`) once before
+opening Xcode so the generated Flutter files exist.
+
+Camera and gallery images are limited to 2048 px on the long side; the models
+use 640 px and 256 px inputs, so full 12 MP photos only added processing time.
+
 ## Build
 
 ```sh
