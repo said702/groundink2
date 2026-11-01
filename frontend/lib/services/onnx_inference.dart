@@ -1,9 +1,15 @@
 import 'dart:convert';
+import 'dart:ffi' as ffi;
 import 'dart:io' show Platform;
 import 'dart:typed_data';
 import 'dart:math' as math;
 import 'package:flutter/services.dart' show rootBundle;
+import 'package:ffi/ffi.dart';
 import 'package:onnxruntime/onnxruntime.dart';
+// The raw tensor accessors need the generated FFI types of the package.
+// ignore: implementation_imports
+import 'package:onnxruntime/src/bindings/onnxruntime_bindings_generated.dart'
+    as bg;
 import 'package:image/image.dart' as img;
 
 /// Offline-ONNX-Inferenz für Wort- und Zeichenerkennung.
@@ -295,55 +301,51 @@ class OnnxInference {
     final scaleX = 1 / scale;
     final scaleY = 1 / scale;
 
-    // Ersten Output parsen - NUR mit try-catch für OOM-Schutz
+    // Ersten Output parsen. Read the float data directly from native memory;
+    // `OrtValue.value` boxed all ~130k values into nested Dart lists per word.
+    void releaseNative() {
+      for (final output in outputs) {
+        output?.release();
+      }
+      runOptions.release();
+      inputOrt.release();
+    }
+
     final outputValue = outputs[0];
     if (outputValue == null) {
-      inputOrt.release();
-      runOptions.release();
+      releaseNative();
       return results;
     }
 
-    List<dynamic> outputData;
+    final _FloatTensor? tensor;
     try {
-      outputData = outputValue.value as List<dynamic>;
+      tensor = _readChannelTensor(outputValue);
     } catch (e) {
-      inputOrt.release();
-      runOptions.release();
-      outputValue.release();
+      releaseNative();
       rethrow;
     }
-
-    if (outputData.isEmpty) {
-      inputOrt.release();
-      runOptions.release();
-      outputValue.release();
+    if (tensor == null || tensor.channels == 0) {
+      releaseNative();
       return results;
     }
 
-    final inner = outputData[0] as List<dynamic>;
-    final numValues = inner.length;
-    if (inner.isEmpty) {
-      inputOrt.release();
-      runOptions.release();
-      outputValue.release();
-      return results;
-    }
-
-    final numDetections = (inner[0] as List<dynamic>).length;
+    final data = tensor.data;
+    final numValues = tensor.channels;
+    final numDetections = tensor.count;
 
     final rawResults = <Map<String, dynamic>>[];
 
     for (int d = 0; d < numDetections; d++) {
       // Erste 4 Werte = bbox
-      final x1 = (inner[0][d] as num).toDouble();
-      final y1 = (inner[1][d] as num).toDouble();
-      final x2 = (inner[2][d] as num).toDouble();
-      final y2 = (inner[3][d] as num).toDouble();
+      final x1 = data[d];
+      final y1 = data[numDetections + d];
+      final x2 = data[2 * numDetections + d];
+      final y2 = data[3 * numDetections + d];
       // YOLO has 62 class scores after xywh, without an objectness column.
       int bestCls = 0;
       double bestScore = 0;
       for (int c = 0; c < numClasses && (4 + c) < numValues; c++) {
-        final score = (inner[4 + c][d] as num).toDouble();
+        final score = data[(4 + c) * numDetections + d];
         if (score > bestScore) {
           bestScore = score;
           bestCls = c;
@@ -384,10 +386,9 @@ class OnnxInference {
         .where((d) => (d['conf'] as double) >= finalConfThreshold)
         .toList();
 
-    // Release the native tensors after decoding.
-    outputValue.release();
-    runOptions.release();
-    inputOrt.release();
+    // Release the native tensors after decoding (all outputs, including the
+    // unused mask prototypes, which were previously leaked for every word).
+    releaseNative();
 
     // Ergebnisse zusammenstellen
     for (int i = 0; i < filtered.length; i++) {
@@ -407,6 +408,80 @@ class OnnxInference {
     results.sort(
         (a, b) => (a['bbox'] as List)[0].compareTo((b['bbox'] as List)[0]));
     return results;
+  }
+
+  /// Reads a `[1, channels, count]` float tensor into a flat buffer.
+  ///
+  /// Copies straight from the tensor memory. Falls back to `OrtValue.value`
+  /// for tensors that are not float or not rank 3. Returns null when the
+  /// tensor is empty.
+  static _FloatTensor? _readChannelTensor(OrtValue value) {
+    final api = OrtEnv.instance.ortApiPtr.ref;
+    final infoPtrPtr = calloc<ffi.Pointer<bg.OrtTensorTypeAndShapeInfo>>();
+    final typePtr = calloc<ffi.Int32>();
+    final rankPtr = calloc<ffi.Size>();
+    final dataPtrPtr = calloc<ffi.Pointer<ffi.Float>>();
+    ffi.Pointer<bg.OrtTensorTypeAndShapeInfo> info = ffi.nullptr;
+    try {
+      OrtStatus.checkOrtStatus(api.GetTensorTypeAndShape.asFunction<
+              bg.OrtStatusPtr Function(ffi.Pointer<bg.OrtValue>,
+                  ffi.Pointer<ffi.Pointer<bg.OrtTensorTypeAndShapeInfo>>)>()(
+          value.ptr, infoPtrPtr));
+      info = infoPtrPtr.value;
+      OrtStatus.checkOrtStatus(api.GetTensorElementType.asFunction<
+          bg.OrtStatusPtr Function(ffi.Pointer<bg.OrtTensorTypeAndShapeInfo>,
+              ffi.Pointer<ffi.Int32>)>()(info, typePtr));
+      OrtStatus.checkOrtStatus(api.GetDimensionsCount.asFunction<
+          bg.OrtStatusPtr Function(ffi.Pointer<bg.OrtTensorTypeAndShapeInfo>,
+              ffi.Pointer<ffi.Size>)>()(info, rankPtr));
+      final rank = rankPtr.value;
+      if (typePtr.value == ONNXTensorElementDataType.float.value && rank == 3) {
+        final dims = calloc<ffi.Int64>(3);
+        try {
+          OrtStatus.checkOrtStatus(api.GetDimensions.asFunction<
+              bg.OrtStatusPtr Function(
+                  ffi.Pointer<bg.OrtTensorTypeAndShapeInfo>,
+                  ffi.Pointer<ffi.Int64>,
+                  int)>()(info, dims, 3));
+          final batch = dims[0], channels = dims[1], count = dims[2];
+          if (batch == 0 || channels == 0) return null;
+          OrtStatus.checkOrtStatus(api.GetTensorMutableData.asFunction<
+                  bg.OrtStatusPtr Function(ffi.Pointer<bg.OrtValue>,
+                      ffi.Pointer<ffi.Pointer<ffi.Void>>)>()(
+              value.ptr, dataPtrPtr.cast()));
+          // Batch 0 only, as in the previous `outputData[0]` access.
+          final data = Float32List.fromList(
+              dataPtrPtr.value.asTypedList(channels * count));
+          return _FloatTensor(data, channels, count);
+        } finally {
+          calloc.free(dims);
+        }
+      }
+    } finally {
+      if (info != ffi.nullptr) {
+        api.ReleaseTensorTypeAndShapeInfo.asFunction<
+            void Function(ffi.Pointer<bg.OrtTensorTypeAndShapeInfo>)>()(info);
+      }
+      calloc.free(infoPtrPtr);
+      calloc.free(typePtr);
+      calloc.free(rankPtr);
+      calloc.free(dataPtrPtr);
+    }
+
+    // Generic fallback (previous behaviour).
+    final outputData = value.value as List<dynamic>;
+    if (outputData.isEmpty) return null;
+    final inner = outputData[0] as List<dynamic>;
+    if (inner.isEmpty) return null;
+    final count = (inner[0] as List<dynamic>).length;
+    final data = Float32List(inner.length * count);
+    for (var ch = 0; ch < inner.length; ch++) {
+      final row = inner[ch] as List<dynamic>;
+      for (var d = 0; d < count; d++) {
+        data[ch * count + d] = (row[d] as num).toDouble();
+      }
+    }
+    return _FloatTensor(data, inner.length, count);
   }
 
   /// Prüft ein Wort offline gegen das Wörterbuch.
@@ -541,4 +616,13 @@ class OnnxInference {
 
     return keep;
   }
+}
+
+/// Flat `[channels, count]` view of a model output (batch 0).
+class _FloatTensor {
+  final Float32List data;
+  final int channels;
+  final int count;
+
+  const _FloatTensor(this.data, this.channels, this.count);
 }
