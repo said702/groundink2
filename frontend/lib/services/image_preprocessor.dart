@@ -85,6 +85,11 @@ class ImagePreprocessor {
     return stretchContrast(result);
   }
 
+  /// Same as [otsuThreshold], computed from a histogram of [total] gray
+  /// values.
+  static int otsuOfHistogram(Int32List hist, int total) =>
+      _FastPreprocessor._otsu(hist, total);
+
   /// Berechnet Otsu-Threshold für ein Graustufenbild.
   static int otsuThreshold(img.Image gray) {
     // Histogramm erstellen

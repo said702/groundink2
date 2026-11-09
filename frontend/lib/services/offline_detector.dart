@@ -306,25 +306,29 @@ class OfflineDetector {
       final text = sortedChars.map((c) => c['char'] as String).join().trim();
       if (text.isEmpty) continue;
 
-      final characters = sortedChars
-          .map((c) => CharacterResult(
-                char: c['char'] as String,
-                bbox: (c['bbox'] as List).cast<int>(),
-                contour: (c['contour'] as List).cast<List<int>>(),
-                confidence: c['confidence'] as double,
-                inkRuns:
-                    CharacterInk.extract(image, (c['bbox'] as List).cast<int>()),
-                mask: c['mask'] != null
-                    ? (c['mask'] as List)
-                        .map((row) => (row as List)
-                            .map((e) => (e as num).toDouble())
-                            .toList())
-                        .toList()
-                    : null,
-                maskW: c['maskW'] as int?,
-                maskH: c['maskH'] as int?,
-              ))
-          .toList();
+      // Each letter's own ink, split where neighboring boxes overlap.
+      final ink = CharacterInk.extractAll(image, [
+        for (final c in sortedChars) (c['bbox'] as List).cast<int>(),
+      ]);
+      final characters = [
+        for (final (k, c) in sortedChars.indexed)
+          CharacterResult(
+            char: c['char'] as String,
+            bbox: (c['bbox'] as List).cast<int>(),
+            contour: (c['contour'] as List).cast<List<int>>(),
+            confidence: c['confidence'] as double,
+            inkRuns: ink[k],
+            mask: c['mask'] != null
+                ? (c['mask'] as List)
+                    .map((row) => (row as List)
+                        .map((e) => (e as num).toDouble())
+                        .toList())
+                    .toList()
+                : null,
+            maskW: c['maskW'] as int?,
+            maskH: c['maskH'] as int?,
+          ),
+      ];
 
       results.add(WordBox(
         text: text,

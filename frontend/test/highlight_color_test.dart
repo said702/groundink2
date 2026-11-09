@@ -21,7 +21,7 @@ import 'package:groundink/theme/highlight_colors.dart';
     img.fillRect(image, x1: x + 4, y1: 6, x2: x + 4, y2: 24, color: mix(0.4));
   }
   final bbox = [4, 2, 56, 28];
-  return (image, CharacterInk.extract(image, bbox), bbox);
+  return (image, CharacterInk.extractAll(image, [bbox]).single, bbox);
 }
 
 void main() {
