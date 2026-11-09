@@ -16,9 +16,11 @@ The app bundles these runtime assets in `assets/models/`:
   words that are never suggested.
 
 Character regions are mapped back to the source image so spelling feedback can
-highlight the corresponding handwritten character. The ink color of each word
-is measured as well: on red, pink or orange handwriting the suspect letters are
-highlighted in blue instead of red.
+highlight the corresponding handwritten character. Boxes of neighboring letters
+often overlap, so every ink pixel of a word belongs to one letter only
+(`lib/services/character_ink.dart`): a wrong letter is colored without parts of
+its neighbors. The ink color of each word is measured as well: on red, pink or
+orange handwriting the suspect letters are highlighted in blue instead of red.
 
 ## Spelling suggestions
 
