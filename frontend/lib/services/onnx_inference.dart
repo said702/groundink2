@@ -280,7 +280,7 @@ class OnnxInference {
     return filtered;
   }
 
-  /// YOLO-Segmentation Zeichen-Modell: Wort-Crop → erkannte Buchstaben + Konturen.
+  /// YOLO-Zeichen-Modell (Detection): Wort-Crop → erkannte Buchstaben.
   /// Gibt Liste von {char, bbox, contour, confidence} zurück, von links nach
   /// rechts. Welche Detektionen Buchstaben werden, entscheidet
   /// [CharacterDecoder].
@@ -372,7 +372,7 @@ class OnnxInference {
       'z'
     ];
 
-    // Output: [1, 98, 1344] = xywh(4), class scores(62), mask coefficients(32).
+    // Output: [1, 66, 1344] = xywh(4), class scores(62).
     const numClasses = 62;
 
     final results = <Map<String, dynamic>>[];
@@ -414,6 +414,7 @@ class OnnxInference {
     final numDetections = tensor.count;
 
     final rawResults = <CharDetection>[];
+    final classes = math.min(numClasses, numValues - 4);
 
     for (int d = 0; d < numDetections; d++) {
       // Erste 4 Werte = bbox
@@ -422,17 +423,10 @@ class OnnxInference {
       final x2 = data[2 * numDetections + d];
       final y2 = data[3 * numDetections + d];
       // YOLO has 62 class scores after xywh, without an objectness column.
-      int bestCls = 0;
-      double bestScore = 0;
-      for (int c = 0; c < numClasses && (4 + c) < numValues; c++) {
-        final score = data[(4 + c) * numDetections + d];
-        if (score > bestScore) {
-          bestScore = score;
-          bestCls = c;
-        }
-      }
-
-      final conf = bestScore;
+      final (bestCls, conf) = CharacterDecoder.bestClass(data,
+          offset: 4 * numDetections + d,
+          stride: numDetections,
+          classes: classes);
       if (conf < CharacterDecoder.low) continue;
 
       // Zurückskalieren auf Wort-Crop-Koordinaten
@@ -450,8 +444,7 @@ class OnnxInference {
       rawResults.add(CharDetection(gx1, gy1, gx2, gy2, conf, bestCls));
     }
 
-    // Release the native tensors after decoding (all outputs, including the
-    // unused mask prototypes, which were previously leaked for every word).
+    // Release the native tensors after decoding (all outputs).
     releaseNative();
 
     for (final det in CharacterDecoder.decode(rawResults)) {

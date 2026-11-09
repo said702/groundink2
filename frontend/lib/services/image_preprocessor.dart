@@ -2,7 +2,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:image/image.dart' as img;
 
-/// Image preprocessing für das Segmentierungs-Modell.
+/// Image preprocessing für das Zeichenmodell.
 /// Implementiert bg_normalize, tight_crop, und white_pad.
 class ImagePreprocessor {
   /// Konvertiert Bild zu Graustufen.
@@ -283,7 +283,7 @@ class ImagePreprocessor {
     return result;
   }
 
-  /// Haupt-Preprocessing-Pipeline für das Segmentierungsmodell.
+  /// Haupt-Preprocessing-Pipeline für das Zeichenmodell.
   /// Entspricht preprocess_bg_norm_tight_pad2 aus Python.
   static img.Image preprocessForSegmentation(img.Image image) {
     return preprocessWithOffset(image).$1;

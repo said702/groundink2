@@ -28,7 +28,7 @@ dictionary, and grounds spelling feedback in the original handwriting.
 The app bundles two ONNX models in `frontend/assets/models/`:
 
 - YOLO26n Nano word detection (640 x 640 input).
-- YOLO26n-Seg Nano character recognition (256 x 256 input).
+- YOLO26n Nano character detection (256 x 256 input).
 
 A spelling model is included for spelling lookup and correction
 suggestions: an English word list with word frequencies and word-pair

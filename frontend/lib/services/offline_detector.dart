@@ -289,7 +289,7 @@ class OfflineDetector {
           img.copyCrop(image, x: x1, y: y1, width: cropW, height: cropH);
       if (crop.width == 0 || crop.height == 0) continue;
 
-      // Preprocessing für das Segmentierungsmodell
+      // Preprocessing für das Zeichenmodell
       final (preprocessed, offsetX, offsetY) =
           ImagePreprocessor.preprocessWithOffset(crop);
 

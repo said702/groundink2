@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:groundink/services/character_decoder.dart';
@@ -55,5 +56,51 @@ void main() {
       CharDetection(12, 0, 22, 20, 0.2, 37), // below the lower bound
     ]);
     expect(text, 'a');
+  });
+
+  group('bestClass', () {
+    /// Class scores of one detection.
+    Float32List scores(Map<String, double> byCharacter) {
+      final s = Float32List(62);
+      byCharacter.forEach((ch, v) => s[classes.indexOf(ch)] = v);
+      return s;
+    }
+
+    String pick(Map<String, double> byCharacter) {
+      final (c, score) = CharacterDecoder.bestClass(scores(byCharacter));
+      return '${classes[c]} ${score.toStringAsFixed(2)}';
+    }
+
+    test('adds up both cases of a letter that looks the same in both', () {
+      // 0.2 and 0.15 are both below the lower bound, the sum is not.
+      expect(pick({'s': 0.2, 'S': 0.15, 'e': 0.3}), 's 0.35');
+    });
+
+    test('gives the sum to the more likely case, lower case on a tie', () {
+      expect(pick({'s': 0.1, 'S': 0.3}), 'S 0.40');
+      expect(pick({'o': 0.2, 'O': 0.2, '0': 0.35}), 'o 0.40');
+    });
+
+    test('keeps the cases of other letters apart', () {
+      expect(pick({'a': 0.2, 'A': 0.15}), 'a 0.20');
+      expect(pick({'y': 0.2, 'Y': 0.15, 'x': 0.1, 'X': 0.08}), 'y 0.20');
+    });
+
+    test('reads one detection of the channel-first model output', () {
+      // [66 channels, 3 detections]: x, y, w, h, then the class scores.
+      const count = 3;
+      final output = Float32List(66 * count);
+      void score(int detection, String ch, double v) =>
+          output[(4 + classes.indexOf(ch)) * count + detection] = v;
+      score(0, 'a', 0.9);
+      score(1, 'x', 0.2);
+      score(1, 'X', 0.1);
+      score(1, 'y', 0.25);
+      score(2, 'k', 0.5);
+      final (c, s) = CharacterDecoder.bestClass(output,
+          offset: 4 * count + 1, stride: count);
+      expect(classes[c], 'x');
+      expect(s, closeTo(0.3, 1e-6));
+    });
   });
 }

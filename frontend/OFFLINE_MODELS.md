@@ -9,8 +9,8 @@ The app bundles these runtime assets in `assets/models/`:
 
 - `word_detection_model.onnx`: YOLO26n Nano word detection (input size:
   `640 x 640` pixels).
-- `char_model_nano_256.onnx`: YOLO26n-Seg Nano character recognition
-  (input size: `256 x 256` pixels).
+- `char_model_nano_256.onnx`: YOLO26n Nano character detection, one box and
+  class per letter (input size: `256 x 256` pixels).
 - `english_lm.bin.gz`: the spelling model — the English word list (the same
   160,572 words as before), word frequencies, word-pair statistics, and the
   words that are never suggested.
