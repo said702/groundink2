@@ -9,6 +9,9 @@ import 'onnx_inference.dart';
 import 'image_preprocessor.dart';
 import 'progress_notifier.dart';
 import 'character_ink.dart';
+import 'ink_color.dart';
+import 'spelling/language_model.dart';
+import 'spelling/spell_checker.dart';
 
 /// Orders detected words in the same top-to-bottom, left-to-right order in
 /// which a reader sees them.
@@ -55,6 +58,43 @@ List<WordBox> sortWordsInReadingOrder(List<WordBox> words) {
   ];
 }
 
+/// Checks one recognized word: (is correct, ranked suggestions).
+///
+/// [previous] and [next] are the neighboring words in reading order; they
+/// rank the suggestions by context. [confidences] are the recognizer's
+/// per-letter confidences, if known.
+(bool, List<String>) checkSpelling(
+  SpellChecker checker,
+  String text, {
+  String? previous,
+  String? next,
+  List<double>? confidences,
+}) {
+  if (checker.isCorrect(text)) return (true, const []);
+  final suggestions = checker.suggest(text,
+      confidences: confidences, previous: previous, next: next);
+  return (false, [for (final s in suggestions) s.word]);
+}
+
+/// Spell-checks [words] (in reading order), using each word's neighbors as
+/// context for the suggestions.
+List<WordBox> checkWordsInContext(List<WordBox> words, SpellChecker checker) {
+  final checked = <WordBox>[];
+  for (var i = 0; i < words.length; i++) {
+    final word = words[i];
+    final confidences = [for (final c in word.characters) c.confidence];
+    final (isCorrect, suggestions) = checkSpelling(
+      checker,
+      word.text,
+      previous: i > 0 ? words[i - 1].text : null,
+      next: i + 1 < words.length ? words[i + 1].text : null,
+      confidences: confidences.length == word.text.length ? confidences : null,
+    );
+    checked.add(word.copyWith(isCorrect: isCorrect, suggestions: suggestions));
+  }
+  return checked;
+}
+
 /// Offline-Erkennungspipeline.
 /// Führt Wort-Detection, Character-Recognition und Spellcheck
 /// komplett lokal auf dem Gerät durch (kein Server nötig).
@@ -66,11 +106,15 @@ class OfflineDetector {
   static ProgressNotifier? progressNotifier;
   static Uint8List? _wordModel;
   static Uint8List? _charModel;
-  static String? _dictionary;
+  static Uint8List? _spellingModel;
 
-  /// Long-lived worker isolate holding the ONNX sessions and dictionary.
+  /// Long-lived worker isolate holding the ONNX sessions and the spelling
+  /// model.
   static Future<(Isolate, SendPort)>? _worker;
   static const _workerExited = 'worker-exited';
+
+  /// Spell checker of the worker isolate (null on the UI isolate).
+  static SpellChecker? _checker;
 
   /// Loads asset data once and starts the worker isolate in the background,
   /// so the first photo does not pay for creating the sessions.
@@ -79,8 +123,8 @@ class OfflineDetector {
         await rootBundle.load('assets/models/word_detection_model.onnx'));
     _charModel ??= Uint8List.sublistView(
         await rootBundle.load('assets/models/char_model_nano_256.onnx'));
-    _dictionary ??=
-        await rootBundle.loadString('assets/models/english_words.json');
+    _spellingModel ??= Uint8List.sublistView(
+        await rootBundle.load('assets/models/english_lm.bin.gz'));
     _ensureWorker().ignore();
   }
 
@@ -101,7 +145,7 @@ class OfflineDetector {
     final exit = ReceivePort();
     final isolate = await Isolate.spawn(
       _workerMain,
-      (ready.sendPort, _wordModel!, _charModel!, _dictionary!),
+      (ready.sendPort, _wordModel!, _charModel!, _spellingModel!),
       onExit: exit.sendPort,
       debugName: 'OfflineDetector',
     );
@@ -116,17 +160,15 @@ class OfflineDetector {
     return (isolate, first as SendPort);
   }
 
-  /// Entry point of the worker isolate: creates the sessions once, then
-  /// processes one photo per request, in order.
+  /// Entry point of the worker isolate: creates the sessions and the spell
+  /// checker once, then answers one request at a time, in order.
   static Future<void> _workerMain(
-      (SendPort, Uint8List, Uint8List, String) args) async {
-    final (ready, wordModel, charModel, dictionary) = args;
+      (SendPort, Uint8List, Uint8List, Uint8List) args) async {
+    final (ready, wordModel, charModel, spellingModel) = args;
     final requests = ReceivePort();
     try {
-      await OnnxInference.init(
-          wordModel: wordModel, charModel: charModel, dictionary: dictionary);
-      // Builds the dictionary set and index now instead of on the first word.
-      OnnxInference.checkWord('a');
+      await OnnxInference.init(wordModel: wordModel, charModel: charModel);
+      _checker = SpellChecker(LanguageModel.fromGzip(spellingModel));
     } catch (e, st) {
       requests.close();
       OnnxInference.dispose();
@@ -135,19 +177,35 @@ class OfflineDetector {
     }
     ready.send(requests.sendPort);
     await for (final message in requests) {
-      final (bytes, reply, progress) =
-          message as (Uint8List, SendPort, SendPort);
+      final request = message as _Request;
       try {
-        reply.send(await _detectInIsolate(bytes, progress));
+        request.reply.send(await request.run());
       } catch (e, st) {
         try {
-          reply.send(_WorkerFailure(e, st.toString()));
+          request.reply.send(_WorkerFailure(e, st.toString()));
         } catch (_) {
           // The error object itself cannot cross isolates; keep its text.
-          reply.send(_WorkerFailure(Exception(e.toString()), st.toString()));
+          request.reply
+              .send(_WorkerFailure(Exception(e.toString()), st.toString()));
         }
       }
     }
+  }
+
+  /// Sends [request] to the worker and returns its answer.
+  static Future<Object?> _ask(_Request Function(SendPort reply) request) async {
+    final (isolate, port) = await _ensureWorker();
+    final reply = ReceivePort();
+    isolate.addOnExitListener(reply.sendPort, response: _workerExited);
+    port.send(request(reply.sendPort));
+    final response = await reply.first;
+    isolate.removeOnExitListener(reply.sendPort);
+    reply.close();
+    if (response == _workerExited) {
+      throw Exception('The recognition worker stopped unexpectedly.');
+    }
+    if (response is _WorkerFailure) response.rethrowIt();
+    return response;
   }
 
   /// Haupt-Pipeline: Foto → erkannte Wörter mit Spellcheck.
@@ -168,18 +226,8 @@ class OfflineDetector {
       final bytes = await imageFile.readAsBytes();
 
       // 3. Komplette Pipeline im Worker-Isolate ausführen
-      final (isolate, port) = await _ensureWorker();
-      final reply = ReceivePort();
-      isolate.addOnExitListener(reply.sendPort, response: _workerExited);
-      port.send((bytes, reply.sendPort, progressPort.sendPort));
-      final response = await reply.first;
-      isolate.removeOnExitListener(reply.sendPort);
-      reply.close();
-      if (response == _workerExited) {
-        throw Exception('The recognition worker stopped unexpectedly.');
-      }
-      if (response is _WorkerFailure) response.rethrowIt();
-      final results = response as List<WordBox>;
+      final results = await _ask((reply) =>
+          _DetectRequest(bytes, reply, progressPort.sendPort)) as List<WordBox>;
 
       _updateProgress(DetectionProgress.done);
       return results;
@@ -190,6 +238,16 @@ class OfflineDetector {
       await subscription.cancel();
       progressPort.close();
     }
+  }
+
+  /// Spell-checks a word the user corrected: (is correct, suggestions).
+  /// [previous] and [next] are its neighbors in reading order.
+  static Future<(bool, List<String>)> checkWord(String text,
+      {String? previous, String? next}) async {
+    await initOnnx();
+    final response = await _ask(
+        (reply) => _SpellRequest(text, previous, next, reply));
+    return response as (bool, List<String>);
   }
 
   /// Interne Pipeline-Funktion, die im Isolate läuft.
@@ -209,7 +267,7 @@ class OfflineDetector {
       return [];
     }
 
-    // Pro Wort: Character-Recognition + Spellcheck
+    // Pro Wort: Character-Recognition
     final results = <WordBox>[];
 
     for (int i = 0; i < wordResults.length; i++) {
@@ -239,60 +297,84 @@ class OfflineDetector {
       final charResults = OnnxInference.recognizeCharacters(
         preprocessed,
         [x1 + offsetX, y1 + offsetY, x2, y2],
-        confThreshold: 0.1,
-        iouThreshold: 0.4,
-        finalConfThreshold: 0.4,
       );
 
-      // Wort-Text aus Buchstaben (links nach rechts sortiert)
-      final sortedChars = List<Map<String, dynamic>>.from(charResults);
-      sortedChars.sort((a, b) {
-        final ax = (a['bbox'] as List)[0] as int;
-        final bx = (b['bbox'] as List)[0] as int;
-        return ax.compareTo(bx);
-      });
+      // Wort-Text aus Buchstaben (already left to right; see
+      // CharacterDecoder for the order of equal positions).
+      final sortedChars = charResults;
 
       final text = sortedChars.map((c) => c['char'] as String).join().trim();
       if (text.isEmpty) continue;
 
-      // Spellcheck (offline)
-      final (isCorrect, suggestions) = OnnxInference.checkWord(text);
+      final characters = sortedChars
+          .map((c) => CharacterResult(
+                char: c['char'] as String,
+                bbox: (c['bbox'] as List).cast<int>(),
+                contour: (c['contour'] as List).cast<List<int>>(),
+                confidence: c['confidence'] as double,
+                inkRuns:
+                    CharacterInk.extract(image, (c['bbox'] as List).cast<int>()),
+                mask: c['mask'] != null
+                    ? (c['mask'] as List)
+                        .map((row) => (row as List)
+                            .map((e) => (e as num).toDouble())
+                            .toList())
+                        .toList()
+                    : null,
+                maskW: c['maskW'] as int?,
+                maskH: c['maskH'] as int?,
+              ))
+          .toList();
 
       results.add(WordBox(
         text: text,
         bbox: [x1, y1, x2, y2],
         confidence: conf,
-        isCorrect: isCorrect,
-        suggestions: suggestions,
-        characters: sortedChars
-            .map((c) => CharacterResult(
-                  char: c['char'] as String,
-                  bbox: (c['bbox'] as List).cast<int>(),
-                  contour: (c['contour'] as List).cast<List<int>>(),
-                  confidence: c['confidence'] as double,
-                  inkRuns: CharacterInk.extract(
-                      image, (c['bbox'] as List).cast<int>()),
-                  mask: c['mask'] != null
-                      ? (c['mask'] as List)
-                          .map((row) => (row as List)
-                              .map((e) => (e as num).toDouble())
-                              .toList())
-                          .toList()
-                      : null,
-                  maskW: c['maskW'] as int?,
-                  maskH: c['maskH'] as int?,
-                ))
-            .toList(),
+        isCorrect: true, // set by the spell check below
+        suggestions: const [],
+        characters: characters,
+        inkColor: InkColor.measure(
+            image, [for (final c in characters) ...c.inkRuns], [x1, y1, x2, y2]),
       ));
     }
 
-    return sortWordsInReadingOrder(results);
+    // Spellcheck (offline) in reading order, so that every word's
+    // neighbors can rank its suggestions.
+    return checkWordsInContext(sortWordsInReadingOrder(results), _checker!);
   }
 
   /// Interne Methode für Progress-Updates.
   static void _updateProgress(DetectionProgress progress) {
     progressNotifier?.update(progress);
   }
+}
+
+/// A job for the worker isolate.
+sealed class _Request {
+  final SendPort reply;
+  const _Request(this.reply);
+  Future<Object?> run();
+}
+
+class _DetectRequest extends _Request {
+  final Uint8List bytes;
+  final SendPort progress;
+  const _DetectRequest(this.bytes, super.reply, this.progress);
+
+  @override
+  Future<Object?> run() => OfflineDetector._detectInIsolate(bytes, progress);
+}
+
+class _SpellRequest extends _Request {
+  final String text;
+  final String? previous;
+  final String? next;
+  const _SpellRequest(this.text, this.previous, this.next, SendPort reply)
+      : super(reply);
+
+  @override
+  Future<Object?> run() async => checkSpelling(OfflineDetector._checker!, text,
+      previous: previous, next: next);
 }
 
 /// An error raised in the worker isolate, rethrown on the caller's side.

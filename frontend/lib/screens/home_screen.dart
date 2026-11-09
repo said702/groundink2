@@ -7,9 +7,14 @@ import '../services/offline_detector.dart';
 import '../services/progress_notifier.dart';
 import '../services/spelling_feedback.dart';
 import '../models/word_box.dart';
+import '../state/review_session.dart';
 import '../widgets/overlay_painter.dart';
 import '../widgets/how_it_works_sheet.dart';
+import '../widgets/photo_panel.dart';
+import '../widgets/review_panel.dart';
+import '../widgets/word_editor_sheet.dart';
 import '../theme/app_theme.dart';
+import '../theme/highlight_colors.dart';
 
 /// Main screen: capture/pick a photo → offline detection → grounded feedback.
 /// No server needed — ONNX models run locally on the device.
@@ -20,18 +25,15 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-enum _ResultFilter { all, correct, errors }
-
 class _HomeScreenState extends State<HomeScreen> {
   File? _imageFile;
   bool _loading = false;
   bool _initializing = true;
-  List<WordBox> _results = [];
-  Map<WordBox, String> _corrections = {};
+  ReviewSession? _session;
+  Rect _crop = Rect.zero;
   String? _error;
   Size _imagePixelSize = Size.zero;
   ui.Image? _displayImage;
-  _ResultFilter _resultFilter = _ResultFilter.all;
 
   // Progress Notifier für detaillierte Fortschrittsanzeige
   final ProgressNotifier _progressNotifier = ProgressNotifier();
@@ -49,6 +51,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void dispose() {
     _progressNotifier.removeListener(_onProgressUpdate);
     _progressNotifier.dispose();
+    _session?.dispose();
     _displayImage?.dispose();
     super.dispose();
   }
@@ -68,6 +71,20 @@ class _HomeScreenState extends State<HomeScreen> {
           _initializing = false;
         });
       }
+    }
+  }
+
+  /// Replaces the review of the previous scan.
+  void _setSession(ReviewSession? session) {
+    final old = _session;
+    _session = session;
+    _crop = session == null
+        ? Rect.zero
+        : _focusedCropRect([for (final e in session.entries) e.word]);
+    ScaffoldMessenger.maybeOf(context)?.hideCurrentSnackBar();
+    // Widgets of the previous scan may still reference it this frame.
+    if (old != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
     }
   }
 
@@ -104,9 +121,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _imageFile = file;
       _displayImage = frame.image;
       _imagePixelSize = pixelSize;
-      _results = [];
-      _corrections = {};
-      _resultFilter = _ResultFilter.all;
+      _setSession(null);
       _error = null;
     });
     oldImage?.dispose();
@@ -120,9 +135,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _imageFile = null;
       _displayImage = null;
       _imagePixelSize = Size.zero;
-      _results = [];
-      _corrections = {};
-      _resultFilter = _ResultFilter.all;
+      _setSession(null);
       _error = null;
     });
     oldImage?.dispose();
@@ -139,7 +152,7 @@ class _HomeScreenState extends State<HomeScreen> {
       final results = await OfflineDetector.detect(_imageFile!);
       if (!mounted) return;
       setState(() {
-        _results = results;
+        _setSession(ReviewSession(results));
         _loading = false;
       });
     } catch (e) {
@@ -277,18 +290,24 @@ class _HomeScreenState extends State<HomeScreen> {
       builder: (context, constraints) {
         final isLandscape = constraints.maxWidth > constraints.maxHeight;
         final isWideTablet = isLandscape && constraints.maxWidth >= 1200;
-        return Column(
-          children: [
-            Expanded(
-              flex: isWideTablet ? 4 : (isLandscape ? 3 : 2),
-              child: _buildPhotoPanel(),
-            ),
-            Expanded(
-              flex: isWideTablet ? 5 : (isLandscape ? 4 : 3),
-              child: _readablePanel(_buildResults()),
-            ),
-          ],
-        );
+        final session = _session;
+        Widget layout() => Column(
+              children: [
+                Expanded(
+                  flex: isWideTablet ? 4 : (isLandscape ? 3 : 2),
+                  child: _buildPhotoPanel(),
+                ),
+                Expanded(
+                  flex: isWideTablet ? 5 : (isLandscape ? 4 : 3),
+                  child: _readablePanel(_buildResults()),
+                ),
+              ],
+            );
+        // The photo follows the review (selection, corrections).
+        return session == null
+            ? layout()
+            : ListenableBuilder(
+                listenable: session, builder: (context, _) => layout());
       },
     );
   }
@@ -307,76 +326,40 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildPhotoPanel() {
-    final crop = _focusedCropRect();
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final aspect = crop.width > 0 && crop.height > 0
-            ? crop.width / crop.height
-            : 4 / 3;
-        final maxWidth = math.max(0.0, constraints.maxWidth - 24);
-        final maxHeight = math.max(0.0, constraints.maxHeight - 18);
-        final panelWidth = math.min(maxWidth, maxHeight * aspect);
-
-        return Center(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
-            child: SizedBox(
-              width: panelWidth,
-              child: AspectRatio(
-                aspectRatio: aspect,
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(16),
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      border: Border.all(color: AppColors.cardBorder),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.05),
-                          blurRadius: 12,
-                          offset: const Offset(0, 4),
-                        ),
-                      ],
-                    ),
-                    clipBehavior: Clip.antiAlias,
-                    child: InteractiveViewer(
-                      maxScale: 6,
-                      child: _imagePixelSize == Size.zero ||
-                              _displayImage == null
-                          ? Image.file(_imageFile!, fit: BoxFit.cover)
-                          : Stack(
-                              fit: StackFit.expand,
-                              children: [
-                                CustomPaint(
-                                  painter: _CroppedPhotoPainter(
-                                    image: _displayImage!,
-                                    sourceRect: crop,
-                                  ),
-                                ),
-                                CustomPaint(
-                                  painter: OverlayPainter(
-                                    results: _visibleResults,
-                                    imageSize: _imagePixelSize,
-                                    corrections: _corrections,
-                                    sourceRect: crop,
-                                  ),
-                                ),
-                              ],
-                            ),
-                    ),
-                  ),
-                ),
+    final session = _session;
+    final current = session?.current;
+    final crop =
+        session == null || _crop.isEmpty ? Offset.zero & _imagePixelSize : _crop;
+    return PhotoPanel(
+      imageFile: _imageFile!,
+      image: _displayImage,
+      imageSize: _imagePixelSize,
+      crop: crop,
+      overlay: [
+        if (session != null)
+          for (final entry in session.entries)
+            if (entry.isOpen)
+              OverlayWord(
+                word: entry.word,
+                correction: entry.correction,
+                color: HighlightColors.forInk(entry.word.inkColor),
+                selected: entry.id == current?.id,
               ),
-            ),
-          ),
-        );
-      },
+      ],
+      words: [
+        if (session != null)
+          for (final entry in session.entries)
+            (id: entry.id, bbox: entry.word.bbox),
+      ],
+      focus: current?.word.bbox,
+      onWordTap:
+          session == null ? null : (id) => _onWordTap(session.entry(id)),
     );
   }
 
-  Rect _focusedCropRect() {
+  Rect _focusedCropRect(List<WordBox> words) {
     final imageRect = Offset.zero & _imagePixelSize;
-    if (_imagePixelSize == Size.zero || _results.isEmpty) {
+    if (_imagePixelSize == Size.zero || words.isEmpty) {
       return imageRect;
     }
 
@@ -385,7 +368,7 @@ class _HomeScreenState extends State<HomeScreen> {
     var right = 0.0;
     var bottom = 0.0;
 
-    for (final word in _results) {
+    for (final word in words) {
       if (word.bbox.length < 4) continue;
       final x1 = word.bbox[0].toDouble();
       final y1 = word.bbox[1].toDouble();
@@ -640,7 +623,8 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    if (_results.isEmpty) {
+    final session = _session;
+    if (session == null || session.entries.isEmpty) {
       return const Center(
         child: Text(
           'No words detected. Try a closer, well-lit photo.',
@@ -649,80 +633,115 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    final correctCount = _results.where((w) => w.isCorrect).length;
-    final errorCount = _results.length - correctCount;
-    final visibleResults = _visibleResults;
-
-    return Column(
-      children: [
-        // Summary chips
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
-          child: Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              _SummaryChip(
-                icon: Icons.text_snippet_outlined,
-                label: '${_results.length} words',
-                color: AppColors.primary,
-                selected: _resultFilter == _ResultFilter.all,
-                onPressed: () => _toggleFilter(_ResultFilter.all),
-              ),
-              _SummaryChip(
-                icon: Icons.check_circle_outline,
-                label: '$correctCount correct',
-                color: AppColors.success,
-                selected: _resultFilter == _ResultFilter.correct,
-                onPressed: () => _toggleFilter(_ResultFilter.correct),
-              ),
-              _SummaryChip(
-                icon: Icons.cancel_outlined,
-                label: '$errorCount errors',
-                color: errorCount > 0 ? AppColors.error : Colors.black38,
-                selected: _resultFilter == _ResultFilter.errors,
-                onPressed: () => _toggleFilter(_ResultFilter.errors),
-              ),
-            ],
-          ),
-        ),
-        // Word cards
-        Expanded(
-          child: ListView.builder(
-            padding: const EdgeInsets.fromLTRB(12, 4, 12, 80),
-             itemCount: visibleResults.length,
-             itemBuilder: (context, index) {
-               final word = visibleResults[index];
-              return _WordCard(
-                word: word,
-                correction: _corrections[word] ??
-                    (word.suggestions.isEmpty ? null : word.suggestions.first),
-                onCorrectionSelected: (value) => setState(() {
-                  _corrections = {..._corrections, word: value};
-                }),
-              );
-            },
-          ),
-        ),
-      ],
+    return ReviewPanel(
+      session: session,
+      onWordTap: _onWordTap,
+      onEdit: (entry, typeCorrection) =>
+          _editWord(entry, typeCorrection: typeCorrection),
+      onDismiss: _dismiss,
     );
   }
 
-  List<WordBox> get _visibleResults {
-    switch (_resultFilter) {
-      case _ResultFilter.all:
-        return _results;
-      case _ResultFilter.correct:
-        return _results.where((word) => word.isCorrect).toList(growable: false);
-      case _ResultFilter.errors:
-        return _results.where((word) => !word.isCorrect).toList(growable: false);
-    }
+  /// A word was tapped on the photo or in the recognized text: show it if
+  /// it is a mistake under review, otherwise offer to correct it.
+  void _onWordTap(ReviewEntry entry) {
+    final session = _session;
+    if (session == null) return;
+    if (!session.show(entry.id)) _editWord(entry);
   }
 
-  void _toggleFilter(_ResultFilter filter) {
-    setState(() {
-      _resultFilter = _resultFilter == filter ? _ResultFilter.all : filter;
-    });
+  void _dismiss(ReviewEntry entry) {
+    final session = _session;
+    if (session == null) return;
+    session.dismiss(entry.id);
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Text('Removed “${entry.word.text}” from the review'),
+        action: SnackBarAction(
+          label: 'Undo',
+          onPressed: () {
+            if (identical(_session, session)) session.restore(entry.id);
+          },
+        ),
+      ));
+  }
+
+  /// Lets the user fix misread letters and/or type the intended word.
+  Future<void> _editWord(ReviewEntry entry,
+      {bool typeCorrection = false}) async {
+    final session = _session;
+    if (session == null) return;
+    final edit = await showWordEditor(
+      context,
+      word: entry.word,
+      correction: entry.isMistake ? entry.correction : null,
+      image: _displayImage,
+      typeCorrection: typeCorrection,
+    );
+    if (edit == null || !mounted || !identical(_session, session)) return;
+
+    var word = entry.word;
+    final writtenChanged = edit.written != word.text;
+    if (writtenChanged) {
+      word = word.copyWith(
+        text: edit.written,
+        characters: SpellingFeedback.realignCharacters(word, edit.written),
+      );
+    }
+    final intended = edit.intended;
+
+    // The word is right as written (e.g. the app had misread a letter).
+    if (intended.isNotEmpty &&
+        intended.toLowerCase() == edit.written.toLowerCase()) {
+      session.update(
+          entry.id, word.copyWith(isCorrect: true, suggestions: const []));
+      _snack('“${edit.written}” is spelled correctly.');
+      return;
+    }
+
+    var isCorrect = word.isCorrect;
+    var suggestions = word.suggestions;
+    if (writtenChanged || intended.isEmpty) {
+      final entries = session.entries;
+      try {
+        (isCorrect, suggestions) = await OfflineDetector.checkWord(
+          edit.written,
+          previous: entry.id > 0 ? entries[entry.id - 1].word.text : null,
+          next: entry.id + 1 < entries.length
+              ? entries[entry.id + 1].word.text
+              : null,
+        );
+      } catch (_) {
+        // Without the spell checker, keep the user's input.
+        suggestions = const [];
+      }
+      if (!mounted || !identical(_session, session)) return;
+    }
+
+    if (intended.isEmpty) {
+      session.update(entry.id,
+          word.copyWith(isCorrect: isCorrect, suggestions: suggestions));
+      if (isCorrect) _snack('“${edit.written}” is spelled correctly.');
+      return;
+    }
+
+    // A mistake whose intended word the user entered.
+    session.update(
+      entry.id,
+      word.copyWith(isCorrect: false, suggestions: [
+        intended,
+        for (final s in suggestions)
+          if (s.toLowerCase() != intended.toLowerCase()) s,
+      ]),
+      target: intended,
+    );
+  }
+
+  void _snack(String message) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
   }
 }
 
@@ -736,193 +755,4 @@ class _PanelTextScaler extends TextScaler {
 
   @override
   double get textScaleFactor => base.scale(14) / 14 * 1.5;
-}
-
-class _CroppedPhotoPainter extends CustomPainter {
-  final ui.Image image;
-  final Rect sourceRect;
-
-  const _CroppedPhotoPainter({
-    required this.image,
-    required this.sourceRect,
-  });
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    canvas.drawImageRect(
-      image,
-      sourceRect,
-      Offset.zero & size,
-      Paint()
-        ..isAntiAlias = true
-        ..filterQuality = FilterQuality.high,
-    );
-  }
-
-  @override
-  bool shouldRepaint(covariant _CroppedPhotoPainter oldDelegate) =>
-      oldDelegate.image != image || oldDelegate.sourceRect != sourceRect;
-}
-
-class _SummaryChip extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final Color color;
-  final bool selected;
-  final VoidCallback onPressed;
-
-  const _SummaryChip(
-      {required this.icon,
-      required this.label,
-      required this.color,
-      required this.selected,
-      required this.onPressed});
-
-  @override
-  Widget build(BuildContext context) {
-    return ChoiceChip(
-      selected: selected,
-      onSelected: (_) => onPressed(),
-      avatar: Icon(icon,
-          size: MediaQuery.sizeOf(context).shortestSide >= 600 ? 26 : 18,
-          color: selected ? Colors.white : color),
-      label: Text(label),
-      labelStyle: TextStyle(
-        fontSize: 12.5,
-        fontWeight: FontWeight.w700,
-        color: selected ? Colors.white : color,
-      ),
-      selectedColor: color,
-      backgroundColor: color.withValues(alpha: 0.08),
-      side: BorderSide(color: color.withValues(alpha: 0.25)),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
-      materialTapTargetSize: MaterialTapTargetSize.padded,
-    );
-  }
-}
-
-class _WordCard extends StatelessWidget {
-  final WordBox word;
-  final String? correction;
-  final ValueChanged<String> onCorrectionSelected;
-
-  const _WordCard(
-      {required this.word,
-      required this.correction,
-      required this.onCorrectionSelected});
-
-  @override
-  Widget build(BuildContext context) {
-    final isCorrect = word.isCorrect;
-    final color = isCorrect ? AppColors.success : AppColors.error;
-    final changed = isCorrect || correction == null
-        ? <int>{}
-        : SpellingFeedback.changedCharacters(word.text, correction!);
-
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: AppColors.cardBorder),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.03),
-            blurRadius: 6,
-            offset: const Offset(0, 2),
-          ),
-        ],
-      ),
-      clipBehavior: Clip.antiAlias,
-      child: IntrinsicHeight(
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            // Colored left border
-            Container(width: 1, color: AppColors.cardBorder),
-            Expanded(
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Icon(
-                          isCorrect ? Icons.check_circle : Icons.error,
-                          color: color,
-                          size: MediaQuery.sizeOf(context).shortestSide >= 600 ? 30 : 20,
-                        ),
-                        const SizedBox(width: 8),
-                        Flexible(
-                          child: Text.rich(
-                            TextSpan(children: [
-                              for (var i = 0; i < word.text.length; i++)
-                                TextSpan(
-                                  text: word.text[i],
-                                  style: TextStyle(
-                                      color: changed.contains(i)
-                                          ? AppColors.error
-                                          : Colors.black87),
-                                ),
-                            ]),
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                                fontSize: 18, fontWeight: FontWeight.w700),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                      ],
-                    ),
-                    const SizedBox(height: 6),
-                    if (isCorrect)
-                      const Text(
-                        'Correctly spelled',
-                        style: TextStyle(fontSize: 13, color: Colors.black54),
-                      )
-                    else if (word.suggestions.isEmpty)
-                      const Text(
-                        'Possible spelling issue - no suggestion found',
-                        style: TextStyle(fontSize: 13, color: Colors.black54),
-                      )
-                    else
-                      Wrap(
-                        crossAxisAlignment: WrapCrossAlignment.center,
-                        spacing: 8,
-                        runSpacing: 6,
-                        children: [
-                          const Text(
-                            'Did you mean:',
-                            style:
-                                TextStyle(fontSize: 13, color: Colors.black54),
-                          ),
-                          ...word.suggestions.map(
-                            (s) => ChoiceChip(
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                              materialTapTargetSize: MaterialTapTargetSize.padded,
-                              selected: s == correction,
-                              label: Text(s,
-                                  style: const TextStyle(
-                                      fontSize: 13,
-                                      fontWeight: FontWeight.w700,
-                                      color: AppColors.accent)),
-                              backgroundColor:
-                                  AppColors.accent.withValues(alpha: 0.08),
-                              side: BorderSide(
-                                  color:
-                                      AppColors.accent.withValues(alpha: 0.35)),
-                              onSelected: (_) => onCorrectionSelected(s),
-                            ),
-                          ),
-                        ],
-                      ),
-                  ],
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
 }

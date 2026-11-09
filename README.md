@@ -14,7 +14,13 @@ dictionary, and grounds spelling feedback in the original handwriting.
 - Captures an image or selects one from the gallery.
 - Uses ONNX Runtime for word detection and character recognition.
 - Displays spelling suggestions and highlights the relevant handwritten
-  character in the source image.
+  character in the source image (in blue instead of red when the writing
+  itself is red).
+- Reviews one mistake at a time: swipe or use the arrows, tap a word on the
+  photo or in the recognized text to jump to it, correct misread letters or
+  enter the intended word, and remove mistakes you do not want to look at.
+- Ranks suggestions by typical children's and recognition mistakes, word
+  frequency, and the neighboring words.
 - Includes Android and iOS project configurations.
 
 ## Models
@@ -24,8 +30,10 @@ The app bundles two ONNX models in `frontend/assets/models/`:
 - YOLO26n Nano word detection (640 x 640 input).
 - YOLO26n-Seg Nano character recognition (256 x 256 input).
 
-An English word list is included for spelling lookup and correction
-suggestions.
+A spelling model is included for spelling lookup and correction
+suggestions: an English word list with word frequencies and word-pair
+statistics. See [`frontend/OFFLINE_MODELS.md`](frontend/OFFLINE_MODELS.md)
+for how suggestions are ranked and for the data sources.
 
 ## Run the app
 
@@ -79,8 +87,9 @@ requires platform-specific signing and release setup.
 ```text
 frontend/                 Flutter application and platform projects
   lib/                    Dart implementation
-  assets/models/          Runtime ONNX models and dictionary
+  assets/models/          Runtime ONNX models and spelling model
   test/                   Flutter tests
+  tool/                   Spelling model build and evaluation scripts
 logo/                     Repository logo used above
 ```
 

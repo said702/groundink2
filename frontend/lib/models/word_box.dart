@@ -23,6 +23,18 @@ class CharacterResult {
     this.inkRuns = const [],
   });
 
+  /// The same ink, read as [char].
+  CharacterResult withChar(String char) => CharacterResult(
+        char: char,
+        bbox: bbox,
+        contour: contour,
+        confidence: confidence,
+        mask: mask,
+        maskW: maskW,
+        maskH: maskH,
+        inkRuns: inkRuns,
+      );
+
   factory CharacterResult.fromJson(Map<String, dynamic> json) {
     return CharacterResult(
       char: json['char'] as String? ?? '?',
@@ -53,6 +65,11 @@ class WordBox {
   final List<String> suggestions;
   final List<CharacterResult> characters;
 
+  /// Typical color of the handwriting (0xAARRGGBB, white-balanced against
+  /// the paper), or null if it could not be measured. Used to pick a
+  /// highlight color that stands out from the ink, e.g. for red pens.
+  final int? inkColor;
+
   WordBox({
     required this.text,
     required this.bbox,
@@ -60,7 +77,24 @@ class WordBox {
     required this.isCorrect,
     required this.suggestions,
     required this.characters,
+    this.inkColor,
   });
+
+  WordBox copyWith({
+    String? text,
+    bool? isCorrect,
+    List<String>? suggestions,
+    List<CharacterResult>? characters,
+  }) =>
+      WordBox(
+        text: text ?? this.text,
+        bbox: bbox,
+        confidence: confidence,
+        isCorrect: isCorrect ?? this.isCorrect,
+        suggestions: suggestions ?? this.suggestions,
+        characters: characters ?? this.characters,
+        inkColor: inkColor,
+      );
 
   factory WordBox.fromJson(Map<String, dynamic> json) {
     return WordBox(
@@ -76,6 +110,7 @@ class WordBox {
               ?.map((e) => CharacterResult.fromJson(e as Map<String, dynamic>))
               .toList() ??
           [],
+      inkColor: json['ink_color'] as int?,
     );
   }
 }

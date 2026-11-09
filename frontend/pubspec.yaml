@@ -24,4 +24,4 @@ flutter:
   assets:
     - assets/models/word_detection_model.onnx
     - assets/models/char_model_nano_256.onnx
-    - assets/models/english_words.json
+    - assets/models/english_lm.bin.gz

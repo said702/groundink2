@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:io' show Platform;
 import 'dart:typed_data';
@@ -12,17 +11,17 @@ import 'package:onnxruntime/src/bindings/onnxruntime_bindings_generated.dart'
     as bg;
 import 'package:image/image.dart' as img;
 
+import 'character_decoder.dart';
+
 /// Offline-ONNX-Inferenz für Wort- und Zeichenerkennung.
 /// Ersetzt den FastAPI-Backend-Aufruf durch lokale ONNX-Runtime.
 class OnnxInference {
   static OrtSession? _wordSession;
   static OrtSession? _charSession;
-  static List<String>? _wordDict;
 
-  /// Lädt beide ONNX-Modelle + Wörterbuch aus den App-Assets.
-  static Future<void> init(
-      {Uint8List? wordModel, Uint8List? charModel, String? dictionary}) async {
-    if (_wordSession != null && _charSession != null && _wordDict != null) {
+  /// Lädt beide ONNX-Modelle aus den App-Assets.
+  static Future<void> init({Uint8List? wordModel, Uint8List? charModel}) async {
+    if (_wordSession != null && _charSession != null) {
       return; // bereits initialisiert
     }
 
@@ -46,11 +45,6 @@ class OnnxInference {
         Uint8List.sublistView(
             await rootBundle.load('assets/models/char_model_nano_256.onnx'));
     _charSession = OrtSession.fromBuffer(charBytes, sessionOptions);
-
-    // Wörterbuch laden
-    final wordsJson = dictionary ??
-        await rootBundle.loadString('assets/models/english_words.json');
-    _wordDict = (jsonDecode(wordsJson) as List<dynamic>).cast<String>();
     sessionOptions.release();
   }
 
@@ -59,7 +53,6 @@ class OnnxInference {
     _charSession?.release();
     _wordSession = null;
     _charSession = null;
-    _wordDict = null;
     OrtEnv.instance.release();
   }
 
@@ -288,19 +281,13 @@ class OnnxInference {
   }
 
   /// YOLO-Segmentation Zeichen-Modell: Wort-Crop → erkannte Buchstaben + Konturen.
-  /// Gibt Liste von {char, bbox, contour, confidence} zurück.
-  ///
-  /// Parameter (entsprechend den Modell-Settings):
-  /// - confThreshold: YOLO-Confidence (default 0.1)
-  /// - iouThreshold: NMS IoU-Threshold (default 0.4)
-  /// - finalConfThreshold: Finale Filterung nach adaptive_conf (default 0.4)
+  /// Gibt Liste von {char, bbox, contour, confidence} zurück, von links nach
+  /// rechts. Welche Detektionen Buchstaben werden, entscheidet
+  /// [CharacterDecoder].
   static List<Map<String, dynamic>> recognizeCharacters(
     img.Image wordCrop,
-    List<int> wordBbox, {
-    double confThreshold = 0.1,
-    double iouThreshold = 0.4,
-    double finalConfThreshold = 0.4,
-  }) {
+    List<int> wordBbox,
+  ) {
     if (_charSession == null) {
       throw Exception('ONNX not initialized. Call OnnxInference.init() first.');
     }
@@ -426,7 +413,7 @@ class OnnxInference {
     final numValues = tensor.channels;
     final numDetections = tensor.count;
 
-    final rawResults = <Map<String, dynamic>>[];
+    final rawResults = <CharDetection>[];
 
     for (int d = 0; d < numDetections; d++) {
       // Erste 4 Werte = bbox
@@ -446,9 +433,7 @@ class OnnxInference {
       }
 
       final conf = bestScore;
-      if (conf < confThreshold) continue;
-
-      final label = bestCls < classNames.length ? classNames[bestCls] : '?';
+      if (conf < CharacterDecoder.low) continue;
 
       // Zurückskalieren auf Wort-Crop-Koordinaten
       final cx1 = ((x1 - x2 / 2 - padX) * scaleX).round();
@@ -462,44 +447,26 @@ class OnnxInference {
       final gx2 = wordBbox[0] + cx2;
       final gy2 = wordBbox[1] + cy2;
 
-      rawResults.add({
-        'char': label,
-        'bbox': [gx1, gy1, gx2, gy2],
-        'conf': conf,
-        'detIdx': d,
-      });
+      rawResults.add(CharDetection(gx1, gy1, gx2, gy2, conf, bestCls));
     }
-
-    // NMS
-    final nmsFiltered =
-        _nms(rawResults, iouThreshold: iouThreshold, maxDetections: 15);
-
-    // Finale Confidence-Filterung
-    final filtered = nmsFiltered
-        .where((d) => (d['conf'] as double) >= finalConfThreshold)
-        .toList();
 
     // Release the native tensors after decoding (all outputs, including the
     // unused mask prototypes, which were previously leaked for every word).
     releaseNative();
 
-    // Ergebnisse zusammenstellen
-    for (int i = 0; i < filtered.length; i++) {
-      final det = filtered[i];
+    for (final det in CharacterDecoder.decode(rawResults)) {
       results.add({
-        'char': det['char'] as String,
-        'bbox': det['bbox'] as List<int>,
+        'char': det.classIndex < classNames.length
+            ? classNames[det.classIndex]
+            : '?',
+        'bbox': [det.x1, det.y1, det.x2, det.y2],
         'contour': <List<int>>[],
         'mask': null,
         'maskW': null,
         'maskH': null,
-        'confidence': det['conf'] as double,
+        'confidence': det.confidence,
       });
     }
-
-    // Sortiere von links nach rechts
-    results.sort(
-        (a, b) => (a['bbox'] as List)[0].compareTo((b['bbox'] as List)[0]));
     return results;
   }
 
@@ -575,137 +542,6 @@ class OnnxInference {
       }
     }
     return _FloatTensor(data, inner.length, count);
-  }
-
-  /// Prüft ein Wort offline gegen das Wörterbuch.
-  /// Gibt (isCorrect, suggestions) zurück.
-  static (bool, List<String>) checkWord(String word,
-      {List<String>? dictionary}) {
-    final words = dictionary ?? _wordDict;
-    if (words == null) {
-      throw Exception(
-          'Dictionary not loaded. Call OnnxInference.init() first.');
-    }
-
-    word = word.trim();
-    if (word.isEmpty) return (true, []);
-
-    final lower = word.toLowerCase();
-    // Building a set from the ~200k-word list used to happen for every word.
-    if (!identical(words, _cachedSetSource)) {
-      _cachedSetSource = words;
-      _cachedWordSet = words.toSet();
-      // Same order as iterating the set, so suggestions keep their order.
-      _cachedWordList = _cachedWordSet!.toList(growable: false);
-      _cachedMasks = Int32List.fromList(
-          [for (final w in _cachedWordList!) _letterMask(w)]);
-      _checkCache.clear();
-    }
-    final wordSet = _cachedWordSet!;
-
-    if (wordSet.contains(lower)) {
-      return (true, []);
-    }
-
-    // Texts repeat words; the suggestion search is the expensive part.
-    final cached = _checkCache[lower];
-    if (cached != null) return (false, List.of(cached));
-
-    // Einfache Edit-Distance-basierte Vorschläge (Levenshtein)
-    final suggestions = <MapEntry<String, int>>[];
-    final length = lower.length;
-    final list = _cachedWordList!;
-    final masks = _cachedMasks!;
-    final mask = _letterMask(lower);
-    for (var i = 0; i < list.length; i++) {
-      final dictWord = list[i];
-      if ((dictWord.length - length).abs() > 2) continue;
-      // One edit changes at most two bits of the letter-presence mask, so
-      // more than four differing bits means a distance above 2.
-      if (_bitCount(masks[i] ^ mask) > 4) continue;
-      final dist = _levenshteinWithin2(lower, dictWord);
-      if (dist <= 2) {
-        suggestions.add(MapEntry(dictWord, dist));
-      }
-    }
-
-    suggestions.sort((a, b) => a.value.compareTo(b.value));
-    final top = suggestions.take(5).map((e) => e.key).toList();
-    _checkCache[lower] = top;
-    return (false, List.of(top));
-  }
-
-  static List<String>? _cachedSetSource;
-  static Set<String>? _cachedWordSet;
-  static List<String>? _cachedWordList;
-  static Int32List? _cachedMasks;
-
-  /// Bit set of the characters in [s] (any char→bit mapping keeps the
-  /// filter in [checkWord] exact; a-z get distinct bits). Bits 0-29 only,
-  /// so values stay positive in an Int32List.
-  static int _letterMask(String s) {
-    var mask = 0;
-    for (var i = 0; i < s.length; i++) {
-      mask |= 1 << (s.codeUnitAt(i) % 30);
-    }
-    return mask;
-  }
-
-  static int _bitCount(int v) {
-    v = v - ((v >> 1) & 0x55555555);
-    v = (v & 0x33333333) + ((v >> 2) & 0x33333333);
-    return (((v + (v >> 4)) & 0x0F0F0F0F) * 0x01010101 >> 24) & 0xFF;
-  }
-
-  static final Map<String, List<String>> _checkCache = {};
-
-  static Int32List _bandPrev = Int32List(0), _bandCur = Int32List(0);
-
-  /// Levenshtein distance restricted to the diagonal band |i - j| <= 2.
-  ///
-  /// Exact for distances up to 2 (any such alignment stays in the band);
-  /// returns a value > 2 otherwise. Computes 5 cells per row instead of the
-  /// whole row and reuses its buffers.
-  static int _levenshteinWithin2(String s1, String s2) {
-    const k = 2;
-    const inf = 1 << 20;
-    final n = s1.length, m = s2.length;
-    if ((n - m).abs() > k) return k + 1;
-    if (s1 == s2) return 0;
-    if (n == 0) return m;
-    if (m == 0) return n;
-    if (_bandPrev.length < m + 2) {
-      _bandPrev = Int32List(m + 2);
-      _bandCur = Int32List(m + 2);
-    }
-    var prev = _bandPrev, cur = _bandCur;
-    for (var j = 0; j <= m + 1; j++) {
-      prev[j] = j <= k ? j : inf;
-    }
-    for (var i = 1; i <= n; i++) {
-      final lo = i - k > 1 ? i - k : 1;
-      final hi = i + k < m ? i + k : m;
-      cur[lo - 1] = lo == 1 ? (i <= k ? i : inf) : inf;
-      var rowMin = cur[lo - 1];
-      final c1 = s1.codeUnitAt(i - 1);
-      for (var j = lo; j <= hi; j++) {
-        final cost = c1 == s2.codeUnitAt(j - 1) ? 0 : 1;
-        var best = prev[j] + 1;
-        final insert = cur[j - 1] + 1;
-        if (insert < best) best = insert;
-        final substitute = prev[j - 1] + cost;
-        if (substitute < best) best = substitute;
-        cur[j] = best;
-        if (best < rowMin) rowMin = best;
-      }
-      // Cell just right of the band must read as unreachable next row.
-      if (hi + 1 <= m) cur[hi + 1] = inf;
-      if (rowMin > k) return k + 1;
-      final swap = prev;
-      prev = cur;
-      cur = swap;
-    }
-    return prev[m];
   }
 
   /// Non-Maximum Suppression: entfernt überlappende Detections (IoU > threshold),

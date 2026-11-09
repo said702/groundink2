@@ -71,7 +71,8 @@ class _HowItWorksSheet extends StatelessWidget {
               color: AppColors.warning,
               title: 'Feedback',
               body: 'Each word is checked against an English dictionary. '
-                  'Misspelled words get correction suggestions.',
+                  'Suggestions are ranked by how common a word is, by '
+                  'typical mistakes, and by the neighboring words.',
             ),
             const _Step(
               number: 4,
@@ -79,7 +80,10 @@ class _HowItWorksSheet extends StatelessWidget {
               color: AppColors.error,
               title: 'Grounded',
               body: 'Letters that differ from the selected suggestion are '
-                  'highlighted in red. Missing letters have no existing stroke to highlight.',
+                  'highlighted in red (in blue if the writing itself is red). '
+                  'Missing letters have no existing stroke to highlight. '
+                  'Swipe through the mistakes, tap a word to correct it, '
+                  'or remove a mistake you do not want to look at.',
             ),
             const SizedBox(height: 8),
             Container(
